@@ -5,130 +5,245 @@ namespace App\Http\Controllers;
 use Illuminate\Http\Request;
 use App\Models\Activity;
 use App\Models\Attendance;
-use App\Models\Trainer;
 use App\Models\Member;
-use Illuminate\Support\Facades\DB;
+use App\Models\Trainer;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 
 class AttendanceController extends Controller
 {
     /**
-     * Menampilkan dashboard Kehadiran (Grafik & Tabel).
+     * Menampilkan halaman utama Absensi/Kehadiran dengan filter dan data tabel.
+     * Route: absensi.index
      */
-    public function absensi(Request $request) // <-- MODIFIKASI: Menerima Request
+    public function index(Request $request)
     {
-        // Ambil nilai filter bulan dari request, defaultnya adalah bulan saat ini (Y-m)
-        $filterMonth = $request->input('month_filter', Carbon::now()->format('Y-m'));
-        
-        try {
-            // Parsing filter menjadi objek Carbon
-            $filterDate = Carbon::createFromFormat('Y-m', $filterMonth);
-        } catch (\Exception $e) {
-            // Jika format invalid, gunakan bulan saat ini
-            $filterDate = Carbon::now();
-        }
-        
-        $targetMonthStart = $filterDate->copy()->startOfMonth();
-        $targetMonthEnd = $filterDate->copy()->endOfMonth();
-        
-        // 1. Ambil data untuk GRAFIK (Persentase Bulanan)
-        $attendanceStats = Attendance::join('activities', 'attendances.activity_id', '=', 'activities.id')
-            ->whereBetween('activities.date', [$targetMonthStart, $targetMonthEnd]) // <-- FILTER DITERAPKAN DI SINI
-            ->select(DB::raw('count(*) as total'), 'status')
-            ->groupBy('status')
-            ->pluck('total', 'status')
-            ->all();
+        // 1. Inisialisasi Filter Waktu
+        $currentDate = Carbon::now();
+        $monthFilter = $request->input('month_filter', $currentDate->format('Y-m'));
+        $dateFilter = $request->input('date_filter');
+        $search = $request->input('search');
 
-        $totalRecords = array_sum($attendanceStats);
+        // Tentukan periode filter
+        if ($dateFilter) {
+            $startDate = Carbon::parse($dateFilter)->startOfDay();
+            $endDate = Carbon::parse($dateFilter)->endOfDay();
+            $titleDate = $startDate;
+            $currentFilter = $dateFilter; // Untuk dikirim kembali ke view
+        } else {
+            $startDate = Carbon::parse($monthFilter)->startOfMonth();
+            $endDate = Carbon::parse($monthFilter)->endOfMonth();
+            $titleDate = $startDate;
+            $currentFilter = $monthFilter; // Untuk dikirim kembali ke view
+        }
+
+        // 2. Penghitungan Data Absensi Bulanan (untuk Chart)
+        $monthlyAttendanceQuery = Attendance::whereHas('activity', function($query) use ($startDate, $endDate) {
+            $query->whereBetween('date', [$startDate, $endDate]);
+        });
+        
+        $totalMonthlyAttendance = $monthlyAttendanceQuery->count();
+        $statusCounts = $monthlyAttendanceQuery
+            ->select('status', DB::raw('count(*) as count'))
+            ->groupBy('status')
+            ->pluck('count', 'status')
+            ->toArray();
 
         $monthlyAttendanceData = [
-            'present' => $totalRecords > 0 ? round(($attendanceStats['present'] ?? 0) / $totalRecords * 100) : 0,
-            'absent' => $totalRecords > 0 ? round(($attendanceStats['absent'] ?? 0) / $totalRecords * 100) : 0,
-            'sick_leave' => $totalRecords > 0 ? round(($attendanceStats['sick_leave'] ?? 0) / $totalRecords * 100) : 0,
-            'permission' => $totalRecords > 0 ? round(($attendanceStats['permission'] ?? 0) / $totalRecords * 100) : 0,
+            'present' => 0, 'absent' => 0, 'sick_leave' => 0, 'permission' => 0,
         ];
 
-
-        // 2. Ambil data untuk TABEL RINGKASAN (Status Kehadiran per Kegiatan)
-        // Catatan: Query ini TIDAK difilter berdasarkan bulan agar selalu menampilkan kegiatan terbaru.
-        $attendanceStatus = Activity::with('trainer', 'attendances')
-            ->orderBy('date', 'desc')
-            ->take(10) 
-            ->get()
-            ->map(function ($activity) {
-                // Hitung status
-                $totalAttendees = $activity->attendances->count();
-                $presentCount = $activity->attendances->where('status', 'present')->count();
-                $percentage = $totalAttendees > 0 ? round(($presentCount / $totalAttendees) * 100) : 0;
-                
-                return [
-                    'trainer_name' => $activity->trainer->name ?? 'N/A',
-                    'date' => $activity->date,
-                    'material' => $activity->material,
-                    'attendance_percentage' => $percentage,
-                ];
-            });
-
-        // 3. Ambil data untuk TABEL RINCIAN PER ANGGOTA ($detailedAttendance)
-        // Catatan: Query ini TIDAK difilter berdasarkan bulan agar selalu menampilkan rincian terbaru.
+        if ($totalMonthlyAttendance > 0) {
+            foreach ($statusCounts as $status => $count) {
+                if (isset($monthlyAttendanceData[$status])) {
+                    $percentage = round(($count / $totalMonthlyAttendance) * 100);
+                    $monthlyAttendanceData[$status] = $percentage;
+                }
+            }
+        }
+        
+        // 3. Rincian Kehadiran Anggota (untuk Tabel)
         $detailedAttendance = Attendance::with(['member', 'activity.trainer'])
-            ->join('activities', 'attendances.activity_id', '=', 'activities.id')
-            ->orderBy('activities.date', 'desc')
-            ->select('attendances.*')
-            ->take(20)
-            ->get();
+            ->whereHas('activity', function($query) use ($startDate, $endDate) {
+                $query->whereBetween('date', [$startDate, $endDate]);
+            })
+            ->when($search, function ($query, $search) {
+                $query->whereHas('member', function ($q) use ($search) {
+                    $q->where('name', 'like', '%' . $search . '%')
+                      ->orWhere('member_id', 'like', '%' . $search . '%')
+                      ->orWhere('study_program', 'like', '%' . $search . '%');
+                });
+            })
+            ->orderBy('created_at', 'desc')
+            ->paginate(20);
 
-
-        // MENGIRIM SEMUA DATA KE VIEW
-        return view('absensi', [
+        // 4. Kirimkan data ke view absensi.index
+        return view('absensi.absensi', [
             'monthlyAttendanceData' => $monthlyAttendanceData,
-            'attendanceStatus' => $attendanceStatus,
             'detailedAttendance' => $detailedAttendance,
+            'titleDate' => $titleDate,
+            'currentFilter' => $currentFilter,
+            'selectedDate' => $dateFilter,
         ]);
     }
 
     /**
-     * Menampilkan formulir untuk menambah data kehadiran baru.
+     * Menampilkan formulir untuk mencatat absensi baru.
+     * Route: absensi.create
      */
     public function create()
     {
-        $members = Member::all(); 
-        $trainers = collect(); 
-        return view('create', compact('trainers', 'members'));
+        $members = Member::orderBy('name')->get();
+        return view('absensi.create', compact('members')); 
     }
 
     /**
-     * Menyimpan data kehadiran yang baru dibuat ke database.
+     * Menyimpan Kegiatan baru dan mencatat absensi.
+     * Route: absensi.store
      */
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'trainer_name' => 'required|string|max:255', 
             'date' => 'required|date',
             'material' => 'required|string|max:255',
+            'trainer_name' => 'required|string|max:255',
             'member_statuses' => 'required|array',
-            'member_statuses.*' => 'required|in:present,absent,sick_leave,permission',
-        ]);
-        
-        $trainer = Trainer::firstOrCreate(
-            ['name' => $validated['trainer_name']]
-        );
-
-        $activity = Activity::create([
-            'trainer_id' => $trainer->id,
-            'date' => $validated['date'],
-            'material' => $validated['material'],
-            'total_members' => count($validated['member_statuses']),
+            'member_statuses.*' => ['required', Rule::in(['present', 'absent', 'sick_leave', 'permission'])],
         ]);
 
-        foreach ($validated['member_statuses'] as $memberId => $status) {
-            Attendance::create([
-                'member_id' => $memberId,
-                'activity_id' => $activity->id,
-                'status' => $status,
+        DB::beginTransaction();
+        try {
+            $trainer = Trainer::firstOrCreate(
+                ['name' => $validated['trainer_name']],
+                ['phone_number' => null]
+            );
+
+            $activity = Activity::create([
+                'date' => $validated['date'],
+                'material' => $validated['material'],
+                'trainer_id' => $trainer->id,
             ]);
+
+            $activityId = $activity->id;
+            $memberStatuses = $validated['member_statuses'];
+            
+            foreach ($memberStatuses as $memberId => $status) {
+                Attendance::updateOrCreate(
+                    ['activity_id' => $activityId, 'member_id' => $memberId],
+                    ['status' => $status]
+                );
+            }
+            
+            DB::commit();
+            return redirect()->route('absensi.index')->with('success', 'Kegiatan dan Absensi berhasil dicatat!');
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return redirect()->back()->withInput()->with('error', 'Gagal mencatat absensi: ' . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Menampilkan halaman pemilihan kegiatan untuk update absensi.
+     * Route: absensi.select
+     */
+    public function selectActivity()
+    {
+        // Ambil data Kegiatan yang tanggalnya sudah lewat atau hari ini
+        $activities = Activity::with('trainer') 
+                            ->where('date', '<=', Carbon::now()->endOfDay())
+                            ->orderBy('date', 'desc')
+                            ->get();
+
+        return view('absensi.select_activity', compact('activities')); 
+    }
+
+    /**
+     * Menampilkan formulir edit absensi untuk Kegiatan tertentu.
+     * Route: absensi.edit
+     */
+    public function editAttendance(Activity $activity)
+    {
+        // 1. Ambil SEMUA anggota terdaftar (Sumber data utama)
+        $members = Member::orderBy('name')->get();
+        
+        // --- DEBUG: Pastikan anggota ada ---
+        if ($members->isEmpty()) {
+            return redirect()->route('absensi.select')->with('info', 'Tidak ada data Anggota (Member) yang terdaftar. Harap tambahkan anggota terlebih dahulu.');
         }
 
-        return redirect()->route('absensi')->with('success', 'Data kehadiran kegiatan baru berhasil ditambahkan!');
+        // 2. Ambil status kehadiran lama untuk kegiatan yang dipilih
+        // Array: [member_id => status]
+        $memberStatuses = Attendance::where('activity_id', $activity->id)
+                                    ->pluck('status', 'member_id')
+                                    ->toArray();
+        
+        // 3. Kirim ke View. 
+        return view('absensi.edit_attendance', [
+            'activity' => $activity,
+            'members' => $members, 
+            'memberStatuses' => $memberStatuses, 
+        ]);
     }
+
+    /**
+     * Menyimpan (UPDATE) perubahan absensi massal.
+     * Route: absensi.update_bulk
+     */
+    public function updateBulkAttendance(Request $request, Activity $activity)
+    {
+        $validated = $request->validate([
+            'attendance' => 'required|array',
+            'attendance.*' => ['required', Rule::in(['present', 'absent', 'sick_leave', 'permission'])],
+        ]);
+
+        DB::beginTransaction();
+        try {
+            $memberStatuses = $validated['attendance'];
+            
+            $updatedCount = 0;
+            foreach ($memberStatuses as $memberId => $status) {
+                $attendance = Attendance::updateOrCreate(
+                    ['activity_id' => $activity->id, 'member_id' => $memberId],
+                    ['status' => $status]
+                );
+                
+                if ($attendance->wasRecentlyCreated || $attendance->wasChanged()) {
+                    $updatedCount++;
+                }
+            }
+
+            DB::commit();
+            return redirect()->route('absensi.index')->with('success', "Absensi kegiatan '{$activity->material}' berhasil diperbarui! ($updatedCount data diubah/ditambahkan)");
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return redirect()->back()->with('error', 'Gagal memperbarui absensi: ' . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Menampilkan laporan absensi (digunakan oleh route laporan.absensi).
+     * Route: laporan.absensi
+     */
+    public function report(Request $request)
+{
+    // Ambil filter bulan dari request
+    $filterDate = $request->input('filter_month', \Carbon\Carbon::now()->format('Y-m'));
+    $titleDate = \Carbon\Carbon::createFromFormat('Y-m', $filterDate);
+    
+    $startDate = $titleDate->copy()->startOfMonth()->toDateString();
+    $endDate = $titleDate->copy()->endOfMonth()->toDateString();
+
+    // Pastikan data ini diambil agar tidak kosong di tabel
+    $members = \App\Models\Member::orderBy('name', 'asc')->get();
+    $activities = \App\Models\Activity::whereBetween('date', [$startDate, $endDate])
+                                      ->orderBy('date', 'asc')
+                                      ->get();
+    $attendances = \App\Models\Attendance::whereIn('activity_id', $activities->pluck('id'))
+                                          ->get();
+
+    return view('laporan.absensi', compact('titleDate', 'filterDate', 'members', 'activities', 'attendances'));
+}
 }
