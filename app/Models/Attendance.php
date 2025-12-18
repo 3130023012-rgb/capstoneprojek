@@ -9,22 +9,25 @@ class Attendance extends Model
 {
     use HasFactory;
     
-    /**
-     * Kolom yang diizinkan untuk diisi secara massal (Mass Assignment).
-     */
+    // Default nama tabel: 'attendances'
+    
     protected $fillable = [
         'member_id',
         'activity_id',
-        'status', // Status: present, absent, sick_leave, permission
+        'status', 
     ];
 
+    // Relasi untuk mendapatkan informasi anggota
     public function member()
     {
         return $this->belongsTo(Member::class);
     }
 
+    // Relasi untuk mendapatkan informasi kegiatan dan tanggalnya
     public function activity()
     {
         return $this->belongsTo(Activity::class);
     }
+    
+    // Catatan: Model ini secara default menggunakan kolom 'created_at' untuk filter tanggal
 }
