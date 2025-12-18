@@ -9,14 +9,14 @@ class Activity extends Model
 {
     use HasFactory;
     
-    /**
-     * Kolom yang diizinkan untuk diisi secara massal (Mass Assignment).
-     */
     protected $fillable = [
         'trainer_id',
         'date',
         'material',
         'total_members',
+        'nominal',              // WAJIB: Kolom baru untuk pengajuan biaya
+        'confirmation_status',  // WAJIB: Kolom baru
+        'description',          // Opsional: Jika Anda menggunakan description
     ];
 
     public function trainer()
@@ -27,5 +27,9 @@ class Activity extends Model
     public function attendances()
     {
         return $this->hasMany(Attendance::class);
+    }
+    public function kasTransactions()
+    {
+        return $this->hasMany(KasTransaction::class, 'activity_id');
     }
 }
